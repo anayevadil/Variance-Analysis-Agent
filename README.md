@@ -1,142 +1,71 @@
-# Explain the Change — Maximor Hackathon (Money Ops track)
+# Variance Analysis Agent
 
-An agent that compares financial results across periods, drills into
-transaction-level data to find real drivers, and produces a concise,
-evidence-backed explanation — and gets smarter about a business's
-patterns the more it's run.
+An AI agent for finance teams that explains month-over-month variances. Give it a file of
+transactions and two periods; it flags the accounts whose balance moved materially, drills into
+the transactions to find what actually drove each move, and writes an Excel report with a short,
+evidence-backed explanation for every material account. It keeps a memory of past findings, so
+running it again on the same business produces sharper explanations.
 
-## Architecture
+Built by Adil Anayev and Heidi Tam for the Maximor hackathon (Money Ops track).
 
-```
-monthly_summary.csv ──► Stage A: variance_engine.py ──► ranked Variance list
-                              (what changed, how much it matters)
-                                      │
-drill_transactions.csv ──► Stage B: drill_down.py ◄──┘
-                              (why: which tag/account/txn drove it)
-                                      │
-                                      ▼
-                          Stage D: memory_store.py
-                          (has this driver shown up before? streak?)
-                                      │
-                                      ▼
-                          Stage C: narrative.py
-                          (renders the final 1-2 sentence explanation)
-                                      │
-                                      ▼
-                              agent.py (orchestrator)
-                                      │
-                                      ▼
-                                  report.md
-```
+## At a glance
 
-## Why this beats naive "sort by pct_change"
-
-The sample summary CSV illustrates the trap directly: `Gift`'s
-`pct_change` column (0.54) looks unremarkable, but the raw series has a
-**3,489 spike in September** sitting in the middle of otherwise
-~$100/month values. A pipeline that only looks at the latest-month delta
-column would miss this entirely.
-
-`variance_engine.py` fixes this by:
-1. Scanning **every** month in the series for anomalies (z-score vs.
-   that category's own mean/std), not just the last column.
-2. Separately scoring **materiality** (dollar size, normalized by the
-   category's own typical volume) so small-base % swings don't
-   dominate the ranking.
-3. Picking whichever signal (anomaly vs. latest-month trend) is more
-   extreme, and flagging *that* period as the one worth explaining.
-
-## Why this beats "just show the top transaction"
-
-`drill_down.py` doesn't just find the single biggest transaction — it
-groups by a dimension (tags, account, category — configurable) and
-reports:
-- **share of period**: what % of the total this driver represents
-  (the "three customers = 64% of the increase" pattern from the brief)
-- **is_new**: whether this driver existed in the prior period at all
-- **frequency vs. size**: e.g. Job's Nov increase came from txn count
-  going 5→20 while avg size dropped 134→39 — a materially different
-  story than "the same customer paid more"
-
-## The "iterates and learns" layer
-
-`memory_store.py` is a flat JSON log of `(category, period) -> top
-driver`. Each agent run appends to it, so by the second and third run
-the agent can say things like:
-
-> "This is the 3rd consecutive month 'tag_4' has been the top driver
-> of Job income."
-
-or flag when a previously-dominant driver disappears. This is cheap to
-build (no DB needed for a demo) but is exactly what turns a one-shot
-analysis into something that "builds intuition about the underlying
-business" across runs, per the brief.
-
-## Running it
-
-```bash
-pip install pandas
-python3 agent.py --summary data/monthly_summary.csv \
-                  --drill data/drill_transactions.csv \
-                  --dimension tags \
-                  --top 5
-```
-
-Run `python3 demo_full_story.py` for the fully worked example on the
-sample data (Job/November, with the 3-run memory streak simulation).
-
-Run any stage standalone for debugging:
-```bash
-python3 variance_engine.py   # Stage A only
-python3 drill_down.py        # Stage B only
-python3 memory_store.py      # Stage D only
-```
-
-## Swapping in a real LLM for phrasing (optional, Stage C)
-
-`narrative.py` has `render_template()` (deterministic, no API needed —
-safe for a live demo) and `render_with_llm()`, which takes an injected
-`call_llm_fn(prompt) -> str` so you can wire up the Claude API (or
-anything else) without narrative.py needing to know about any SDK. The
-prompt explicitly instructs the model to use only the numbers it's
-given — it never sees raw transactions, so it can't invent figures.
-
-```python
-def call_llm_fn(prompt: str) -> str:
-    import anthropic
-    client = anthropic.Anthropic()
-    msg = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=200,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return msg.content[0].text
-
-explanation = render_with_llm(variance, drill, streak_note, call_llm_fn)
-```
-
-## Extending for the real hackathon dataset
-
-- If your real transaction CSV uses a different grouping column than
-  `tags` (e.g. `merchant`, `counterparty`), just pass
-  `--dimension merchant`.
-- If categories don't line up 1:1 between the summary and drill files
-  (naming mismatches), add a normalization step before `drill_into()`.
-- `_prior_period()` in `drill_down.py` currently assumes monthly
-  granularity (`YYYY-MM`) — adjust if your periods are weekly/quarterly.
-- For multi-account rollups, drill on `account` as a second pass after
-  `tags` to show both "what kind of transaction" and "which account"
-  drove it.
-
-## File guide
-
-| File | Purpose |
+| | |
 |---|---|
-| `variance_engine.py` | Stage A — rank variances, catch mid-series anomalies |
-| `drill_down.py` | Stage B — find transaction-level drivers per flagged period |
-| `narrative.py` | Stage C — render the final explanation (template or LLM) |
-| `memory_store.py` | Stage D — persist driver history, detect streaks/shifts |
-| `agent.py` | Orchestrator — CLI entrypoint, wires A→B→C→D together |
-| `demo_full_story.py` | Worked example + memory simulation for the demo |
-| `data/` | Sample CSVs (your provided data) |
-| `memory/driver_history.json` | Persisted state, grows across runs |
+| **What it does** | Compares two periods, applies a materiality rule (change over 10% and above a minimum amount), then runs a Claude tool-use loop per material account to find which category, tags and transactions drove the change, and how unusual it is against that category's own history. |
+| **Data** | One CSV of transactions with `date_time, type, category, account, amount, currency, tags` (expenses and income together). The bundled sample (`v2/data/sample_transactions.csv`, about 1,300 rows, 2025, BYN) comes from the Kaggle dataset [Financial transactions: expenses and income](https://www.kaggle.com/datasets/artemkabseu/financial-transactions-dataset-expenses-and-income). |
+| **Stack** | Python 3.11, pandas, Claude API (`anthropic` SDK tool runner with `@beta_tool` functions), openpyxl for the report, a JSON memory store, pytest (30 tests). |
+| **Output** | An Excel workbook, `reports/variance_report_<dataset>_<period_a>_vs_<period_b>.xlsx`, with a **Summary** sheet (one row per account: both period totals, $ and % change, a Material flag, and the explanation, with material accounts highlighted and linked) and a **Drill-Down** sheet (driving category, how unusual its move is, the tags that concentrate the change and their share, and the supporting transactions). |
+
+Example explanation from a run on the sample data (October vs November 2025, expenses):
+
+> **acct_1 changed by −53.2% (−879 BYN), driven by "Loan given" dropping −969 BYN (992 → 23),
+> with 1 contributor (tag_1) accounting for 100% of that change, mainly the non-recurrence of
+> October's single 854 BYN loan.** A new 299 BYN "Clothes" charge (also tag_1) partially offset
+> the decline.
+
+## How it works
+
+```
+transactions CSV ─► monthly summary ─► materiality rule ─► for each material account:
+                                       (plain Python)       Claude tool-use loop
+                                                              ├─ get_business_context   (memory)
+                                                              ├─ compare_categories     (dollar impact + z-score)
+                                                              ├─ analyze_concentration  (which tags drove it)
+                                                              ├─ get_transactions       (evidence)
+                                                              └─ record_insight         (writes memory)
+                                                                   │
+                                     Excel report  ◄── structured findings
+```
+
+- Which accounts get analyzed is decided by a transparent business rule, not by the model.
+- Every number in the report is computed in Python; the model explains them but never invents them.
+- `v2/memory/context.json` stores past findings and notes about accounts (for example "acct_2
+  behaves like a shared account"), and every run reads it first.
+
+## Run it
+
+```bash
+cd v2
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+export ANTHROPIC_API_KEY=...
+
+python agent.py --data data/sample_transactions.csv --dataset expenses
+python agent.py --data data/sample_transactions.csv --dataset both \
+    --period-a 2025-10 --period-b 2025-11 "focus on seasonal categories"
+
+pytest   # offline tests, no API key needed
+```
+
+`--dataset` is `expenses`, `income` or `both`; the periods default to the two most recent in the
+file. Without `--data` the agent looks for `sample_transactions.csv` on your Desktop.
+[`v2/MANUAL.md`](v2/MANUAL.md) walks through the code step by step.
+
+## Repository layout
+
+| Path | What it is |
+|---|---|
+| `v2/` | Current version: the tool-use agent, analysis modules, Excel report, memory, tests |
+| `*.py`, `data/` at the root | First hackathon version: a staged pipeline (variance engine, drill-down, narrative, memory). See [docs/v1-hackathon.md](docs/v1-hackathon.md) |
+| `legacy/` | The original single-file prototype and notebook |
